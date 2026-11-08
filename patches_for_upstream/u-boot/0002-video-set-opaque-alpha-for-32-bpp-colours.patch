@@ -1,0 +1,32 @@
+From 94961fcc23467e032ea95879adc1c53e4566dcb2 Mon Sep 17 00:00:00 2001
+From: k <k@example.com>
+Date: Fri, 6 Nov 2026 17:12:18 +0800
+Subject: [PATCH 2/5] video: set opaque alpha for 32-bpp colours
+
+ARGB-only display hardware (RK3568 VOP2 has no XRGB format) shows
+X8R8G8B8 pixels with alpha 0 as transparent. Return 0xff in the top
+byte from video_index_to_colour().
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/video/video-uclass.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/video/video-uclass.c b/drivers/video/video-uclass.c
+index 22183d00..79dbcd30 100644
+--- a/drivers/video/video-uclass.c
++++ b/drivers/video/video-uclass.c
+@@ -355,7 +355,12 @@ u32 video_index_to_colour(struct video_priv *priv, enum colour_idx idx)
+ 				       (colours[idx].g << 16) |
+ 				       (colours[idx].b << 8) | 0xff;
+ 			default:
+-				return (colours[idx].r << 16) |
++				/*
++				 * Opaque alpha: harmless for XRGB scanout,
++				 * needed by ARGB-only hardware (RK3568 VOP2)
++				 */
++				return 0xff000000 |
++				       (colours[idx].r << 16) |
+ 				       (colours[idx].g <<  8) |
+ 				       (colours[idx].b <<  0);
+ 			}

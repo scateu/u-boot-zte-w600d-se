@@ -1,0 +1,274 @@
+From a1e847c29e38545a54d291bdac1439ba63f4cb9a Mon Sep 17 00:00:00 2001
+From: k <k@example.com>
+Date: Fri, 6 Nov 2026 17:12:18 +0800
+Subject: [PATCH 3/5] video: rockchip: add RK3568 VOP2 takeover driver
+
+Mainline has no RK3568 VOP2 driver. When U-Boot is chain-loaded from the
+Rockchip vendor U-Boot, the panel is already lit: find the enabled VOP2
+window (preferring one scanning out of the vendor logo memory), keep its
+size, and point it at a new ARGB8888 framebuffer with y-mirror, RB swap
+and AFBC off. CRTC, encoder, panel and backlight are left untouched.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/video/Kconfig                         |   9 +
+ drivers/video/Makefile                        |   1 +
+ drivers/video/rockchip/rk3568_vop2_takeover.c | 217 ++++++++++++++++++
+ 3 files changed, 227 insertions(+)
+ create mode 100755 drivers/video/rockchip/rk3568_vop2_takeover.c
+
+diff --git a/drivers/video/Kconfig b/drivers/video/Kconfig
+index de0197b2..3173e1d1 100644
+--- a/drivers/video/Kconfig
++++ b/drivers/video/Kconfig
+@@ -929,6 +929,15 @@ config VIDEO_IVYBRIDGE_IGD
+ 
+ source "drivers/video/rockchip/Kconfig"
+ 
++config VIDEO_ROCKCHIP_VOP2_TAKEOVER
++	bool "Rockchip RK3568 VOP2: reuse a display set up by a previous bootloader"
++	depends on VIDEO && ARCH_ROCKCHIP
++	help
++	  For U-Boot chain-loaded after a bootloader (e.g. the Rockchip vendor
++	  U-Boot) that has already enabled the RK3568 VOP2 and the panel. The
++	  window that is on screen is switched to an ARGB8888 U-Boot
++	  framebuffer; the rest of the display pipeline is left as it is.
++
+ config VIDEO_SANDBOX_SDL
+ 	bool "Enable sandbox video console using SDL"
+ 	depends on SANDBOX_SDL
+diff --git a/drivers/video/Makefile b/drivers/video/Makefile
+index 7a7b54e6..3a586fbe 100644
+--- a/drivers/video/Makefile
++++ b/drivers/video/Makefile
+@@ -38,6 +38,7 @@ obj-$(CONFIG_BACKLIGHT_LP855x) += lp855x_backlight.o
+ obj-$(CONFIG_BACKLIGHT_SAMSUNG_CMC623) += cmc623_backlight.o
+ obj-${CONFIG_EXYNOS_FB} += exynos/
+ obj-${CONFIG_VIDEO_ROCKCHIP} += rockchip/
++obj-${CONFIG_VIDEO_ROCKCHIP_VOP2_TAKEOVER} += rockchip/rk3568_vop2_takeover.o
+ obj-${CONFIG_VIDEO_STM32} += stm32/
+ obj-${CONFIG_$(PHASE_)VIDEO_TIDSS} += tidss/
+ obj-y += ti/
+diff --git a/drivers/video/rockchip/rk3568_vop2_takeover.c b/drivers/video/rockchip/rk3568_vop2_takeover.c
+new file mode 100755
+index 00000000..b95fef6e
+--- /dev/null
++++ b/drivers/video/rockchip/rk3568_vop2_takeover.c
+@@ -0,0 +1,217 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * RK3568 VOP2 "take over" video driver.
++ *
++ * Mainline U-Boot has no VOP2 driver. When U-Boot is chain-loaded from a
++ * bootloader that already lit the panel (e.g. the Rockchip vendor U-Boot
++ * showing its boot logo), the display pipeline (VOP2 video port, eDP/HDMI
++ * encoder, PHY, clocks, panel power) is left running. This driver only
++ * re-points the window that is on screen at a U-Boot framebuffer and switches
++ * it to ARGB8888, so the normal video/vidconsole stack can be used.
++ *
++ * Nothing else in the display pipeline is touched.
++ */
++
++#include <cpu_func.h>
++#include <dm.h>
++#include <log.h>
++#include <video.h>
++#include <asm/io.h>
++#include <linux/bitops.h>
++#include <linux/sizes.h>
++
++#define VOP2_REG_CFG_DONE		0x000
++#define VOP2_CFG_DONE_GLB_EN		BIT(15)
++#define VOP2_CFG_DONE_VP_ALL		(0x7 | (0x7 << 16))
++
++/* Smart/Esmart window registers (relative to the window base) */
++#define SMART_CTRL1			0x04
++#define SMART_CTRL1_YMIRROR		BIT(31)
++#define SMART_REGION0_CTRL		0x10
++#define SMART_REGION0_YRGB_MST		0x14
++#define SMART_REGION0_VIR		0x1c
++#define SMART_REGION0_ACT_INFO		0x20
++#define SMART_REGION0_DSP_INFO		0x24
++
++/* Cluster window registers (relative to the window base) */
++#define CLUSTER_WIN_CTRL0		0x00
++#define CLUSTER_WIN_YRGB_MST		0x10
++#define CLUSTER_WIN_VIR			0x18
++#define CLUSTER_WIN_ACT_INFO		0x20
++#define CLUSTER_WIN_DSP_INFO		0x24
++#define CLUSTER_WIN_AFBCD_ROTATE_MODE	0x54
++#define CLUSTER_ROTATE_XYMIRROR		(BIT(2) | BIT(3))
++#define CLUSTER_CTRL			0x100
++#define CLUSTER_CTRL_AFBC_EN		BIT(1)
++
++/* Common bits of SMART_REGION0_CTRL and CLUSTER_WIN_CTRL0 */
++#define WIN_EN				BIT(0)
++#define WIN_FMT_MASK			GENMASK(5, 1)
++#define WIN_FMT_ARGB8888		(0 << 1)
++#define WIN_RB_SWAP			BIT(14)
++
++#define VOP2_MAX_SIZE			(SZ_4K * 4 * 2160)
++
++struct vop2_win {
++	const char *name;
++	u32 offset;
++	bool cluster;
++};
++
++static const struct vop2_win rk3568_wins[] = {
++	{ "Smart0",   0x1c00, false },	/* W600D: eDP primary plane (VP1) */
++	{ "Smart1",   0x1e00, false },
++	{ "Esmart0",  0x1800, false },
++	{ "Esmart1",  0x1a00, false },
++	{ "Cluster0", 0x1000, true },
++	{ "Cluster1", 0x1200, true },
++};
++
++struct vop2_takeover_priv {
++	void __iomem *regs;
++	const struct vop2_win *win;
++	u32 width, height;
++};
++
++static u32 win_ctrl_reg(const struct vop2_win *win)
++{
++	return win->offset + (win->cluster ? CLUSTER_WIN_CTRL0 : SMART_REGION0_CTRL);
++}
++
++static u32 win_dsp_info_reg(const struct vop2_win *win)
++{
++	return win->offset + (win->cluster ? CLUSTER_WIN_DSP_INFO : SMART_REGION0_DSP_INFO);
++}
++
++/* Find the window that is on screen, preferring the one scanning out @lo..@hi */
++static const struct vop2_win *vop2_find_win(void __iomem *regs, u32 lo, u32 hi)
++{
++	const struct vop2_win *first = NULL;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(rk3568_wins); i++) {
++		const struct vop2_win *win = &rk3568_wins[i];
++		u32 mst_reg = win->offset + (win->cluster ? CLUSTER_WIN_YRGB_MST :
++					     SMART_REGION0_YRGB_MST);
++		u32 mst;
++
++		if (!(readl(regs + win_ctrl_reg(win)) & WIN_EN))
++			continue;
++		mst = readl(regs + mst_reg);
++		log_debug("%s: enabled, yrgb_mst=%08x\n", win->name, mst);
++		if (mst >= lo && mst < hi)
++			return win;
++		if (!first)
++			first = win;
++	}
++
++	return first;
++}
++
++static int vop2_takeover_bind(struct udevice *dev)
++{
++	struct video_uc_plat *plat = dev_get_uclass_plat(dev);
++
++	plat->size = dev_read_u32_default(dev, "max-framebuffer-size",
++					  VOP2_MAX_SIZE);
++	plat->align = SZ_64K;
++
++	return 0;
++}
++
++static int vop2_takeover_probe(struct udevice *dev)
++{
++	struct video_uc_plat *plat = dev_get_uclass_plat(dev);
++	struct video_priv *uc_priv = dev_get_uclass_priv(dev);
++	struct vop2_takeover_priv *priv = dev_get_priv(dev);
++	const struct vop2_win *win;
++	u32 lo, hi, info, stride, val, i;
++	u32 range[2];
++	u32 *fb;
++
++	priv->regs = dev_read_addr_ptr(dev);
++	if (!priv->regs)
++		return -EINVAL;
++
++	/* Memory the previous bootloader scanned out from (optional hint) */
++	if (dev_read_u32_array(dev, "rockchip,logo-memory", range, 2)) {
++		range[0] = 0;
++		range[1] = 0;
++	}
++	lo = range[0];
++	hi = range[0] + range[1];
++
++	win = vop2_find_win(priv->regs, lo, hi);
++	if (!win) {
++		log_err("VOP2: no active window, display not initialised\n");
++		return -ENODEV;
++	}
++
++	info = readl(priv->regs + win_dsp_info_reg(win));
++	priv->width = (info & 0xffff) + 1;
++	priv->height = (info >> 16) + 1;
++	stride = priv->width * 4;
++	if (stride * priv->height > plat->size) {
++		log_err("VOP2: %ux%u does not fit the framebuffer\n",
++			priv->width, priv->height);
++		return -ENOSPC;
++	}
++	priv->win = win;
++
++	uc_priv->xsize = priv->width;
++	uc_priv->ysize = priv->height;
++	uc_priv->line_length = stride;
++	uc_priv->bpix = VIDEO_BPP32;
++	uc_priv->format = VIDEO_X8R8G8B8;
++	video_set_flush_dcache(dev, true);
++
++	/* Black, opaque frame before the window is switched over */
++	fb = (u32 *)plat->base;
++	for (i = 0; i < stride / 4 * priv->height; i++)
++		fb[i] = 0xff000000;
++	flush_dcache_range(plat->base,
++			   ALIGN(plat->base + stride * priv->height,
++				 CONFIG_SYS_CACHELINE_SIZE));
++
++	if (win->cluster) {
++		clrbits_le32(priv->regs + win->offset + CLUSTER_CTRL,
++			     CLUSTER_CTRL_AFBC_EN);
++		clrbits_le32(priv->regs + win->offset + CLUSTER_WIN_AFBCD_ROTATE_MODE,
++			     CLUSTER_ROTATE_XYMIRROR);
++		writel(plat->base, priv->regs + win->offset + CLUSTER_WIN_YRGB_MST);
++		writel(stride / 4, priv->regs + win->offset + CLUSTER_WIN_VIR);
++		writel(info, priv->regs + win->offset + CLUSTER_WIN_ACT_INFO);
++	} else {
++		clrbits_le32(priv->regs + win->offset + SMART_CTRL1,
++			     SMART_CTRL1_YMIRROR);
++		writel(plat->base, priv->regs + win->offset + SMART_REGION0_YRGB_MST);
++		writel(stride / 4, priv->regs + win->offset + SMART_REGION0_VIR);
++		writel(info, priv->regs + win->offset + SMART_REGION0_ACT_INFO);
++	}
++	val = readl(priv->regs + win_ctrl_reg(win));
++	val &= ~(WIN_FMT_MASK | WIN_RB_SWAP);
++	val |= WIN_FMT_ARGB8888;
++	writel(val, priv->regs + win_ctrl_reg(win));
++
++	writel(VOP2_CFG_DONE_GLB_EN | VOP2_CFG_DONE_VP_ALL,
++	       priv->regs + VOP2_REG_CFG_DONE);
++
++	log_info("VOP2: took over %s, %ux%u, fb %lx\n", win->name,
++		 priv->width, priv->height, plat->base);
++
++	return 0;
++}
++
++static const struct udevice_id vop2_takeover_ids[] = {
++	{ .compatible = "rockchip,rk3568-vop-takeover" },
++	{ }
++};
++
++U_BOOT_DRIVER(rk3568_vop2_takeover) = {
++	.name		= "rk3568_vop2_takeover",
++	.id		= UCLASS_VIDEO,
++	.of_match	= vop2_takeover_ids,
++	.bind		= vop2_takeover_bind,
++	.probe		= vop2_takeover_probe,
++	.priv_auto	= sizeof(struct vop2_takeover_priv),
++};

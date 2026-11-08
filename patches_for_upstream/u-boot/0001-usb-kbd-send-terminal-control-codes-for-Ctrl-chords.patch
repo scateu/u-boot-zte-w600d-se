@@ -1,0 +1,57 @@
+From 95b73d061b77a5c492bd20d0767c80922e9bf823 Mon Sep 17 00:00:00 2001
+From: k <k@example.com>
+Date: Fri, 6 Nov 2026 17:12:18 +0800
+Subject: [PATCH 1/5] usb: kbd: send terminal control codes for Ctrl chords
+
+With Ctrl held, every key was sent as scancode - 3. That is right for
+letters (a = 0x04 -> ^A = 0x01) but wrong for all other keys: Ctrl-Space
+gave ')' (0x2c - 3), Ctrl-\ gave '.', Ctrl-] '-', Ctrl-- '*', and
+Ctrl-Enter / Ctrl-arrows gave letters.
+
+Map like a terminal: letters and @ [ \ ] ^ _ to 0x00-0x1f, Ctrl-Space
+and Ctrl-2 to NUL, Ctrl-6 to 0x1e, Ctrl-- and Ctrl-/ to 0x1f; any other
+key is sent unchanged. NUL is queued directly, since a keycode of 0
+means "no key" in usb_kbd_translate().
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/usb_kbd.c | 26 ++++++++++++++++++++++++--
+ 1 file changed, 24 insertions(+), 2 deletions(-)
+
+diff --git a/common/usb_kbd.c b/common/usb_kbd.c
+index 25d8a0df..db3ce7e2 100644
+--- a/common/usb_kbd.c
++++ b/common/usb_kbd.c
+@@ -231,8 +231,30 @@ static int usb_kbd_translate(struct usb_kbd_pdata *data, unsigned char scancode,
+ 	if ((scancode >= 0x54) && (scancode <= 0x67))
+ 		keycode = usb_kbd_num_keypad[scancode - 0x54];
+ 
+-	if (data->flags & USB_KBD_CTRL)
+-		keycode = scancode - 0x3;
++	/*
++	 * Ctrl chords, as a terminal sends them: letters and @ [ \ ] ^ _ map to
++	 * 0x00-0x1f (Ctrl-Space and Ctrl-2 to NUL, Ctrl-- and Ctrl-/ to 0x1f,
++	 * Ctrl-6 to 0x1e); any other key is sent unchanged.
++	 */
++	if (data->flags & USB_KBD_CTRL) {
++		switch (keycode) {
++		case 'a' ... 'z':
++		case 'A' ... 'Z':
++		case '[': case '\\': case ']': case '^': case '_':
++			keycode &= 0x1f;
++			break;
++		case '6':
++			keycode = 0x1e;
++			break;
++		case '-': case '/':
++			keycode = 0x1f;
++			break;
++		case ' ': case '2': case '@':
++			/* NUL: a keycode of 0 means "no key" below */
++			usb_kbd_put_queue(data, 0);
++			return 0;
++		}
++	}
+ 
+ 	if (pressed == 1) {
+ 		if (scancode == NUM_LOCK) {

@@ -1,0 +1,141 @@
+--- a/Kconfig	2026-08-14 17:13:20
++++ b/Kconfig	2026-11-06 16:49:10
+@@ -49,8 +49,8 @@
+ 
+ 	  `imply` (not `select`) so a board can still turn any of these off; the
+ 	  editor then loses just that feature, not the build. The twwfi debug/
+-	  metering command is built alongside typewriter (see the Makefile) and
+-	  uses the same optional subsystems.
++	  metering command is built with TW_RK3399_POWERSAVE (see the Makefile)
++	  and uses the same optional subsystems.
+ 
+ 	  Notes:
+ 	    - Filenames are ASCII-only (U-Boot's FAT long-name codec can't
+@@ -62,9 +62,39 @@
+ 
+ 	  Use: typewriter <iftype> <dev:part> <filename> [fstype]
+ 
++config TW_DEFAULT_IFTYPE
++	string "typewriter: interface of the default file"
++	depends on CMD_TYPEWRITER
++	default "mmc"
++	help
++	  Interface a bare `typewriter` (no arguments) opens, e.g. "mmc" or
++	  "usb". Default: the microSD on gru/kevin (mmc 1:1).
++
++config TW_DEFAULT_DEVPART
++	string "typewriter: <dev:part> of the default file"
++	depends on CMD_TYPEWRITER
++	default "1:1"
++
++config TW_DEFAULT_FILE
++	string "typewriter: name of the default file"
++	depends on CMD_TYPEWRITER
++	default "a.txt"
++
++config TW_RK3399_POWERSAVE
++	bool "typewriter: RK3399 (gru/kevin) power-save and WFI code"
++	depends on CMD_TYPEWRITER && ARM64 && ROCKCHIP_RK3399
++	default y
++	help
++	  At startup, drop the A53 cluster to 408 MHz (pwm regulator
++	  "ppvar_litcpu_pwm"), DDR to 400 MHz (bl31 SIP) and gate unused
++	  clock/power domains by writing the RK3399 CRU/PMU directly; also
++	  builds the `twwfi` debug command and the WFI idle path, which poke
++	  the RK3399 GIC and GPIO0. These addresses are RK3399-only - on any
++	  other SoC leave this off; the editor then idles by polling.
++
+ config TW_WFI_IDLE
+ 	bool "typewriter: deep-sleep the CPU with WFI when idle"
+-	depends on CMD_TYPEWRITER && ARM64
++	depends on TW_RK3399_POWERSAVE
+ 	default n
+ 	help
+ 	  When idle (no keypress for ~2 s), execute a real WFI that sleeps the
+--- a/Makefile	2026-08-07 16:23:56
++++ b/Makefile	2026-11-06 16:49:10
+@@ -1,9 +1,10 @@
+ # SPDX-License-Identifier: GPL-2.0+
+-# Build rules for the `typewriter` command. APPEND these lines to U-Boot's
+-# existing cmd/Makefile after copying the sources into cmd/ - do NOT overwrite
+-# cmd/Makefile with this file (that would drop bootm/booti/bootd etc. and break
+-# the U-Boot link with "undefined reference to do_bootm").
++# Build rules for the `typewriter` command. Drop this directory in as
++# cmd/typewriter/ and add to cmd/Makefile:
++#   obj-$(CONFIG_CMD_TYPEWRITER) += typewriter/
++# (or copy the sources straight into cmd/ and append these lines there - do NOT
++# overwrite cmd/Makefile, that drops bootm/booti/bootd and breaks the link).
+ obj-$(CONFIG_CMD_TYPEWRITER) += cmd_tw.o cmd_tw_fs.o cmd_tw_video.o \
+ 				ime_table.o wubi_embed.o font_data.o
+-# Temporary WFI-idle debug command (twwfi); remove once WFI idle is solved.
+-obj-$(CONFIG_CMD_TYPEWRITER) += cmd_twwfi.o
++# WFI-idle debug command (twwfi): pokes RK3399 GIC/CRU/GPIO directly.
++obj-$(CONFIG_TW_RK3399_POWERSAVE) += cmd_twwfi.o
+--- a/cmd_tw.c	2026-11-05 16:12:00
++++ b/cmd_tw.c	2026-11-06 16:52:26
+@@ -28,7 +28,7 @@
+ #include <power/regulator.h>  /* lower A53 core rail to its 408 MHz OPP voltage */
+ #include <asm/system.h>
+ #include <time.h>
+-#if defined(CONFIG_ARM64) && defined(__aarch64__)
++#if defined(CONFIG_TW_RK3399_POWERSAVE)
+ #include <asm/io.h>       /* readl/writel/setbits_le32 for the WFI GIC setup */
+ #include <asm/gic.h>      /* ICC_* sysreg encodings */
+ #define _TW_STR(x) #x
+@@ -78,7 +78,7 @@
+  * bl31 leaves IRQs un-routed to EL3 in normal running, so taking them at EL2
+  * works. (Verified: `twwfi irq`/`twwfi keystroke` return on the armed event.)
+  */
+-#if defined(CONFIG_ARM64) && defined(__aarch64__)
++#if defined(CONFIG_TW_RK3399_POWERSAVE)
+ #define TW_GICD_CTLR        0xfee00000UL      /* GIC distributor control */
+ #define TW_GICD_ISENABLER   0xfee00100UL      /* GICD set-enable (SPIs, 1 bit/INTID) */
+ #define TW_GICD_ICPENDR     0xfee00280UL      /* GICD clear-pending (1 bit/INTID) */
+@@ -545,8 +545,13 @@
+ 	}
+ }
+ 
+-#else   /* host / non-arm64: plain delay (WFE-equivalent) */
+-static void tw_idle_nap(unsigned int ms) { udelay(ms * 1000); }
++#else   /* not RK3399 (or host): no WFI, poll like the !TW_WFI_IDLE path */
++static void tw_idle_nap(unsigned int ms)
++{
++	(void)ms;
++	schedule();
++	udelay(TW_IDLE_POLL_MS * 1000);
++}
+ static void tw_set_cpu_408(void) { }
+ static void tw_set_ddr_400(void) { }
+ static void tw_gate_unused_domains(void) { }
+@@ -1495,7 +1500,7 @@
+ }
+ #else
+ static void tw_poweroff_events_clear(void) { }
+-//static int tw_poweroff_event_pending(void) { return 0; }
++static int tw_poweroff_event_pending(void) { return 0; }
+ /* Non-arm64 (TPL/host): no EC access. tw_handle_key (Ctrl-T) is compiled
+  * outside the arm64 guard, so it needs these to link; report "unavailable". */
+ int tw_read_charge_state(int *pct, int *chg_ma, int *ac) { return -ENODEV; }
+@@ -2279,9 +2284,9 @@
+ 	/* Defaults for a bare `typewriter`: the microSD, which has a working
+ 	 * FAT write path on this board (the eMMC's is broken - see
+ 	 * KNOWN_ISSUES). The microSD is writable by default. */
+-	const char *iftype  = "mmc";
+-	const char *devpart = "1:1";
+-	const char *fname   = "a.txt";
++	const char *iftype  = CONFIG_TW_DEFAULT_IFTYPE;
++	const char *devpart = CONFIG_TW_DEFAULT_DEVPART;
++	const char *fname   = CONFIG_TW_DEFAULT_FILE;
+ 	int want_ro = 0;
+ 	int i;
+ 
+@@ -2386,7 +2391,8 @@
+ U_BOOT_CMD(
+ 	typewriter, 6, 0, do_typewriter,
+ 	"Nano-like editor with Wubi Chinese input (framebuffer)",
+-	"                        - default: open mmc 1:1 a.txt (writable)\n"
++	"                        - default: open " CONFIG_TW_DEFAULT_IFTYPE " "
++	CONFIG_TW_DEFAULT_DEVPART " " CONFIG_TW_DEFAULT_FILE " (writable)\n"
+ 	"typewriter -h                        - show this help\n"
+ 	"typewriter <iftype> <dev:part> <filename> [fstype] [ro]\n"
+ 	"  iftype  : mmc usb virtio nvme sata\n"

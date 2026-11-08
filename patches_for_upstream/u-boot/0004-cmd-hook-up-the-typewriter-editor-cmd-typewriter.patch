@@ -1,0 +1,37 @@
+From 004b44e7632f811e1430177c5f93b4a9aba9cc82 Mon Sep 17 00:00:00 2001
+From: k <k@example.com>
+Date: Fri, 6 Nov 2026 17:12:18 +0800
+Subject: [PATCH 4/5] cmd: hook up the typewriter editor (cmd/typewriter/)
+
+Sources: https://github.com/scateu/u-boot-typewriter, copied into
+cmd/typewriter/ by patch-u-boot.sh.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ cmd/Kconfig  | 2 ++
+ cmd/Makefile | 1 +
+ 2 files changed, 3 insertions(+)
+
+diff --git a/cmd/Kconfig b/cmd/Kconfig
+index ace0b2e9..6a0029ac 100644
+--- a/cmd/Kconfig
++++ b/cmd/Kconfig
+@@ -3288,4 +3288,6 @@ config CMD_SPAWN_NUM_JOBS
+ 	  When a jobs exits, its identifier is available to be re-used by the next
+ 	  spawn command.
+ 
++source "cmd/typewriter/Kconfig"
++
+ endif
+diff --git a/cmd/Makefile b/cmd/Makefile
+index 7c3db81e..5abbc709 100644
+--- a/cmd/Makefile
++++ b/cmd/Makefile
+@@ -37,6 +37,7 @@ obj-$(CONFIG_CMD_BMP) += bmp.o
+ obj-$(CONFIG_CMD_BOOTCOUNT) += bootcount.o
+ obj-$(CONFIG_CMD_BOOTEFI) += bootefi.o
+ obj-$(CONFIG_CMD_BOOTMENU) += bootmenu.o
++obj-$(CONFIG_CMD_TYPEWRITER) += typewriter/
+ obj-$(CONFIG_CMD_BOOTSTAGE) += bootstage.o
+ obj-$(CONFIG_CMD_BOOTZ) += bootz.o
+ obj-$(CONFIG_CMD_BOOTI) += booti.o
